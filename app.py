@@ -6,7 +6,7 @@ from pymongo import MongoClient
 app = Flask(__name__)
 CORS(app)
 
-MONGO_URI = "mongodb://codelab1:neucodelab@101.96.66.219:8000/?authMechanism=SCRAM-SHA-1"
+MONGO_URI = "mongodb://codelab1:fitx@101.96.66.219:8000/?authMechanism=SCRAM-SHA-1"
 client = MongoClient(MONGO_URI)
 db = client["vncodelab"]
 collection = db["logs"]
@@ -70,6 +70,9 @@ def get_hardworking_data2():
         return jsonify({})
 
     return jsonify(process_logs(df))
+
+
+
 
 if __name__ == "__main__":
     app.run(debug=True)
