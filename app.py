@@ -12,9 +12,12 @@ db = client["vncodelab"]
 collection = db["logs"]
 
 def process_logs(df):
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-    df = df.dropna(subset=["timestamp"])  # Loại bỏ dòng có timestamp lỗi
-    df["week"] = df["timestamp"].dt.to_period("W").apply(lambda r: r.start_time.strftime("%Y-%m-%d"))
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    if df["timestamp"].dt.tz is not None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+
+    cutoff_date = pd.Timestamp("2025-02-19")
+    start_date = pd.Timestamp("2024-12-23")
 
     # Xác định cột tên người dùng: Ưu tiên 'user', nếu không có thì lấy 'userName'
     if "user" in df.columns:
@@ -24,46 +27,66 @@ def process_logs(df):
 
     df = df.dropna(subset=["user_final"])  # Loại bỏ dòng không có user nào cả
 
-    activity_by_week = df.groupby(["week", "user_final"]).size().reset_index(name="activity_count")
-    afk_by_week = df[df["logType"] == "leaveRoom"].groupby(["week", "user_final"]).size().reset_index(name="afk_count")
+    df = df[df["logType"] != "leaveRoom"]
+    df = df.sort_values(["user_final", "timestamp"])
 
-    merged_data = pd.merge(activity_by_week, afk_by_week, on=["week", "user_final"], how="left").fillna(0)
-    merged_data["afk_count"] = merged_data["afk_count"].astype(int)
-    merged_data["real_activity"] = merged_data["activity_count"] - merged_data["afk_count"]
+    df["custom_week"] = ((df["timestamp"] - start_date).dt.days // 7) + 1
 
-    max_real_activity_per_week = merged_data.groupby("week")["real_activity"].transform("max")
-    merged_data["hardworking_score"] = (merged_data["real_activity"] / max_real_activity_per_week) * 100
-    merged_data["hardworking_score"] = merged_data["hardworking_score"].fillna(0).astype(int)
+    df["time_diff"] = df.groupby("user_final")["timestamp"].diff()
+    df["time_diff_seconds"] = df["time_diff"].dt.total_seconds()
 
-    output_json = {}
-    for _, row in merged_data.iterrows():
-        week = row["week"]
-        user = row["user_final"]
-        if week not in output_json:
-            output_json[week] = {}
-        output_json[week][user] = {
-            "activity_count": int(row["activity_count"]),
-            "afk_count": int(row["afk_count"]),
-            "real_activity": int(row["real_activity"]),
-            "hardworking_score": int(row["hardworking_score"]),
-        }
-    return output_json
+    max_diff = 800 
+    df["time_diff_seconds"] = df["time_diff_seconds"].apply(
+        lambda x: x if (x is not None and x > 0 and x <= max_diff) else 0
+    )
 
-@app.route("/api/hardworking", methods=["GET"])
-def get_hardworking_data():
-    df = pd.read_csv("vncodelab.logs.csv")
-    return jsonify(process_logs(df))
+    study_time_per_week = df.groupby(["user_final", "custom_week"])["time_diff_seconds"].sum()
+    activity_per_week = df.groupby(["user_final", "custom_week"])["timestamp"].count()
 
-@app.route("/api/hardworking2", methods=["GET"])
+    max_activity_per_week = activity_per_week.groupby("custom_week").max()
+    max_activity_series = pd.Series(index=activity_per_week.index)
+    for week in activity_per_week.index.get_level_values('custom_week').unique():
+        max_val = max_activity_per_week.loc[week]
+        idx = activity_per_week.index[activity_per_week.index.get_level_values('custom_week') == week]
+        max_activity_series.loc[idx] = max_val
+
+    hardworking_score = (activity_per_week / max_activity_series) * 100
+
+    hardworking_q1 = hardworking_score.groupby("custom_week").quantile(0.25)
+    hardworking_q3 = hardworking_score.groupby("custom_week").quantile(0.75)
+    hardworking_iqr = hardworking_q3 - hardworking_q1
+    hardworking_threshold = hardworking_q1 - 1.5 * hardworking_iqr
+
+    study_time_q1 = study_time_per_week.groupby("custom_week").quantile(0.25)
+    study_time_q3 = study_time_per_week.groupby("custom_week").quantile(0.75)
+    study_time_iqr = study_time_q3 - study_time_q1
+    study_time_threshold = study_time_q1 - 1.5 * study_time_iqr
+
+    attendance_criteria = pd.DataFrame({
+        "Total Study Time (s)": study_time_per_week,
+        "Hardworking Score": hardworking_score
+    }).reset_index()
+
+    attendance_criteria["Attendance"] = attendance_criteria.apply(
+        lambda row: "✓" if row["Total Study Time (s)"] >= study_time_threshold.get(row["custom_week"], 0) and 
+                        row["Hardworking Score"] >= hardworking_threshold.get(row["custom_week"], 0)
+                    else "", axis=1
+    )
+
+    weekly_attendance = attendance_criteria.pivot(index="user_final", columns="custom_week", values="Attendance")
+    
+    return weekly_attendance.to_dict()
+
+@app.route("/api/hardworking3", methods=["GET"])
 def get_hardworking_data2():
     room_id = request.args.get("roomID")
     if not room_id:
         return jsonify({"error": "Thiếu roomID"}), 400
 
-    data = list(collection.find({"roomID": room_id}, {"_id": 0}))  # Loại bỏ ObjectId để tránh lỗi
+    data = list(collection.find({"roomID": room_id}, {"_id": 0}))  
 
-    # Debug dữ liệu MongoDB
-    print("Dữ liệu từ MongoDB:", data)
+    if not data:
+        return jsonify({})
 
     df = pd.DataFrame(data)
     if df.empty:
